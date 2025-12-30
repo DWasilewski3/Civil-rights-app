@@ -1,0 +1,571 @@
+/**
+ * Debug instrumentation for Famous preview iframes
+ * Captures console logs, errors, user interactions, and network requests
+ * to provide rich debugging context for AI-assisted error fixing.
+ */
+if (window.location.hostname.startsWith('preview-')) {
+  (function() {
+    // Session ID for correlating events
+    const SESSION_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Helper to send messages to parent
+    const sendToParent = (messageData) => {
+      if (window.parent) {
+        window.parent.postMessage(messageData, '*');
+      }
+    };
+
+    // Base event creator with common fields
+    const makeBaseEvent = () => ({
+      sessionId: SESSION_ID,
+      url: window.location.href,
+      timestamp: Date.now(),
+    });
+
+    // ========================================
+    // 1. Console method overrides
+    // ========================================
+    const originalMethods = {
+      log: console.log,
+      warn: console.warn,
+      error: console.error,
+      info: console.info
+    };
+
+    ['log', 'warn', 'error', 'info'].forEach(method => {
+      console[method] = function(...args) {
+        originalMethods[method].apply(console, args);
+
+        const messageData = {
+          ...makeBaseEvent(),
+          type: 'console',
+          method: method,
+          args: args
+        };
+
+        if (method === 'error') {
+          const errorArg = args.find(arg => arg instanceof Error);
+          if (errorArg && errorArg.stack) {
+            messageData.args = args.map(arg => {
+              if (arg instanceof Error) {
+                return {
+                  message: arg.message,
+                  stack: arg.stack,
+                  name: arg.name,
+                  _source: 'console.error'
+                };
+              }
+              return arg;
+            });
+          } else {
+            try {
+              throw new Error("Stack trace");
+            } catch (e) {
+              if (e instanceof Error) {
+                const stackLines = e.stack ? e.stack.split('\n') : [];
+                stackLines.splice(1, 1);
+                const enhancedStack = stackLines.join('\n');
+
+                messageData.args = [...args, {
+                  _synthetic: true,
+                  stack: enhancedStack,
+                  _source: 'console.error'
+                }];
+              }
+            }
+          }
+        }
+
+        sendToParent(messageData);
+      };
+    });
+
+    // ========================================
+    // 2. Global error handlers with source context
+    // ========================================
+    
+    // Cache for fetched source files to avoid re-fetching
+    const sourceCache = new Map();
+    
+    // Fetch source file and extract lines around error location
+    const fetchSourceContext = async (filename, lineno, colno) => {
+      if (!filename || !lineno) return null;
+      
+      try {
+        // Check cache first
+        let sourceText = sourceCache.get(filename);
+        
+        if (!sourceText) {
+          // Fetch the source file
+          const response = await originalFetch(filename);
+          if (!response.ok) return null;
+          
+          sourceText = await response.text();
+          // Cache it (limit cache size)
+          if (sourceCache.size > 10) {
+            const firstKey = sourceCache.keys().next().value;
+            sourceCache.delete(firstKey);
+          }
+          sourceCache.set(filename, sourceText);
+        }
+        
+        const lines = sourceText.split('\n');
+        const totalLines = lines.length;
+        
+        // Get ~10 lines before and after the error line
+        const contextRadius = 10;
+        const startLine = Math.max(0, lineno - contextRadius - 1);
+        const endLine = Math.min(totalLines, lineno + contextRadius);
+        
+        const contextLines = [];
+        for (let i = startLine; i < endLine; i++) {
+          const lineNum = i + 1;
+          const isErrorLine = lineNum === lineno;
+          const line = lines[i] || '';
+          // Truncate very long lines (minified code can have 10k+ char lines)
+          const truncatedLine = line.length > 200 
+            ? line.substring(Math.max(0, (colno || 0) - 100), Math.min(line.length, (colno || 0) + 100))
+            : line;
+          contextLines.push({
+            lineNum,
+            code: truncatedLine,
+            isErrorLine,
+            // For very long lines, indicate we're showing a window around the column
+            isWindowedView: line.length > 200
+          });
+        }
+        
+        return {
+          filename: filename,
+          lineno: lineno,
+          colno: colno,
+          totalLines: totalLines,
+          contextLines: contextLines
+        };
+      } catch (e) {
+        // Silently fail - source context is optional
+        return null;
+      }
+    };
+    
+    // Parse stack trace to extract file locations
+    const parseStackTrace = (stack) => {
+      if (!stack) return [];
+      
+      const locations = [];
+      // Match patterns like "at functionName (url:line:col)" or "at url:line:col"
+      const stackRegex = /at\s+(?:[\w.<>]+\s+)?\(?([^)\s]+):(\d+):(\d+)\)?/g;
+      let match;
+      
+      while ((match = stackRegex.exec(stack)) !== null && locations.length < 3) {
+        locations.push({
+          filename: match[1],
+          lineno: parseInt(match[2], 10),
+          colno: parseInt(match[3], 10)
+        });
+      }
+      
+      return locations;
+    };
+    
+    // Send error with source context
+    const sendErrorWithContext = async (errorData) => {
+      // Send immediately without context
+      sendToParent({
+        ...makeBaseEvent(),
+        type: 'console',
+        method: 'error',
+        args: [errorData]
+      });
+      
+      // Then try to fetch source context and send as a follow-up
+      const locations = [];
+      
+      // Add explicit location if available
+      if (errorData.filename && errorData.lineno) {
+        locations.push({
+          filename: errorData.filename,
+          lineno: errorData.lineno,
+          colno: errorData.colno
+        });
+      }
+      
+      // Also try to parse locations from stack trace
+      if (errorData.stack) {
+        locations.push(...parseStackTrace(errorData.stack));
+      }
+      
+      // Fetch source context for the first few locations
+      const sourceContexts = [];
+      for (const loc of locations.slice(0, 2)) {
+        const context = await fetchSourceContext(loc.filename, loc.lineno, loc.colno);
+        if (context) {
+          sourceContexts.push(context);
+        }
+      }
+      
+      if (sourceContexts.length > 0) {
+        sendToParent({
+          ...makeBaseEvent(),
+          type: 'source-context',
+          errorMessage: errorData.message,
+          contexts: sourceContexts
+        });
+      }
+    };
+    
+    window.addEventListener('error', (event) => {
+      const err = event.error || new Error(event.message || 'Unknown error');
+      sendErrorWithContext({
+        message: err.message,
+        stack: err.stack,
+        name: err.name,
+        filename: event.filename,
+        lineno: event.lineno,
+        colno: event.colno,
+        _source: 'window.onerror'
+      });
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const reason = event.reason instanceof Error
+        ? event.reason
+        : new Error(
+            typeof event.reason === 'string'
+              ? event.reason
+              : JSON.stringify(event.reason)
+          );
+
+      sendErrorWithContext({
+        message: reason.message,
+        stack: reason.stack,
+        name: reason.name,
+        _source: 'unhandledrejection'
+      });
+    });
+
+    // ========================================
+    // 3. User interaction tracking
+    // ========================================
+    const buildElementSelector = (el) => {
+      if (!el || !el.tagName) return null;
+      const parts = [];
+      let current = el;
+
+      while (current && current.tagName && parts.length < 4) {
+        let part = current.tagName.toLowerCase();
+        if (current.id) part += `#${current.id}`;
+        if (current.className && typeof current.className === 'string') {
+          const cls = current.className
+            .split(/\s+/)
+            .filter(Boolean)
+            .slice(0, 3)
+            .join('.');
+          if (cls) part += `.${cls}`;
+        }
+        parts.unshift(part);
+        current = current.parentElement;
+      }
+
+      return parts.join(' > ');
+    };
+
+    let lastClickTimestamp = 0;
+    document.addEventListener('click', (event) => {
+      const now = Date.now();
+      // Debounce to avoid spamming
+      if (now - lastClickTimestamp < 50) return;
+      lastClickTimestamp = now;
+
+      const target = event.target;
+      const selector = buildElementSelector(target);
+      const text = target && 'innerText' in target
+        ? String(target.innerText).trim().slice(0, 120)
+        : '';
+
+      sendToParent({
+        ...makeBaseEvent(),
+        type: 'user-event',
+        eventType: 'click',
+        selector: selector,
+        text: text,
+        button: event.button
+      });
+    }, true); // Capture phase to get it before app handlers stopPropagation
+
+    // Track route changes for SPAs
+    const originalPushState = history.pushState;
+    const originalReplaceState = history.replaceState;
+
+    history.pushState = function(...args) {
+      const result = originalPushState.apply(this, args);
+      sendToParent({
+        ...makeBaseEvent(),
+        type: 'user-event',
+        eventType: 'navigation',
+        method: 'pushState',
+        newUrl: args[2] || window.location.href
+      });
+      return result;
+    };
+
+    history.replaceState = function(...args) {
+      const result = originalReplaceState.apply(this, args);
+      sendToParent({
+        ...makeBaseEvent(),
+        type: 'user-event',
+        eventType: 'navigation',
+        method: 'replaceState',
+        newUrl: args[2] || window.location.href
+      });
+      return result;
+    };
+
+    window.addEventListener('popstate', () => {
+      sendToParent({
+        ...makeBaseEvent(),
+        type: 'user-event',
+        eventType: 'navigation',
+        method: 'popstate',
+        newUrl: window.location.href
+      });
+    });
+
+    // ========================================
+    // 4. Network request instrumentation
+    // ========================================
+    
+    // Helper to extract headers as a plain object
+    const headersToObject = (headers) => {
+      if (!headers) return {};
+      const result = {};
+      try {
+        if (headers instanceof Headers) {
+          headers.forEach((value, key) => {
+            // Skip sensitive headers
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === 'authorization' || lowerKey === 'cookie' || lowerKey === 'set-cookie') {
+              result[key] = '[REDACTED]';
+            } else {
+              result[key] = value.slice(0, 500);
+            }
+          });
+        } else if (typeof headers === 'object') {
+          Object.entries(headers).forEach(([key, value]) => {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === 'authorization' || lowerKey === 'cookie' || lowerKey === 'set-cookie') {
+              result[key] = '[REDACTED]';
+            } else {
+              result[key] = String(value).slice(0, 500);
+            }
+          });
+        }
+      } catch {
+        // Silently fail if headers can't be read
+      }
+      return result;
+    };
+    
+    // Instrument fetch
+    const originalFetch = window.fetch;
+    window.fetch = async function(input, init = {}) {
+      const start = performance.now();
+      const reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+      const url = typeof input === 'string' ? input : (input.url || String(input));
+      const method = (init.method || 'GET').toUpperCase();
+
+      // Capture request headers
+      let requestHeaders = {};
+      if (init.headers) {
+        requestHeaders = headersToObject(init.headers);
+      }
+      // Also check if input is a Request object with headers
+      if (typeof input === 'object' && input.headers) {
+        requestHeaders = { ...requestHeaders, ...headersToObject(input.headers) };
+      }
+
+      let requestBody = init.body;
+      if (requestBody && typeof requestBody !== 'string') {
+        try {
+          requestBody = JSON.stringify(requestBody).slice(0, 2000);
+        } catch {
+          requestBody = '[unserializable body]';
+        }
+      } else if (typeof requestBody === 'string') {
+        requestBody = requestBody.slice(0, 2000);
+      }
+
+      const networkEventBase = {
+        ...makeBaseEvent(),
+        type: 'network',
+        transport: 'fetch',
+        requestId: reqId,
+        method: method,
+        url: url.slice(0, 500),
+        requestHeaders: requestHeaders,
+        requestBody: requestBody
+      };
+
+      try {
+        const response = await originalFetch(input, init);
+        const cloned = response.clone();
+
+        // Capture response headers
+        const responseHeaders = headersToObject(response.headers);
+
+        let responseBody;
+        try {
+          const text = await cloned.text();
+          responseBody = text.slice(0, 2000);
+        } catch {
+          responseBody = '[unreadable response body]';
+        }
+
+        sendToParent({
+          ...networkEventBase,
+          status: response.status,
+          statusText: response.statusText,
+          ok: response.ok,
+          durationMs: Math.round(performance.now() - start),
+          responseHeaders: responseHeaders,
+          responseBody: responseBody
+        });
+
+        return response;
+      } catch (err) {
+        sendToParent({
+          ...networkEventBase,
+          status: 0,
+          ok: false,
+          durationMs: Math.round(performance.now() - start),
+          errorMessage: err instanceof Error ? err.message : String(err)
+        });
+        throw err;
+      }
+    };
+
+    // Instrument XMLHttpRequest for older code patterns
+    const XHROpen = XMLHttpRequest.prototype.open;
+    const XHRSend = XMLHttpRequest.prototype.send;
+    const XHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      this._famous_method = method;
+      this._famous_url = url;
+      this._famous_start = null;
+      this._famous_reqId = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      this._famous_requestHeaders = {};
+      return XHROpen.apply(this, [method, url, ...rest]);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+      // Track request headers
+      if (this._famous_requestHeaders) {
+        const lowerName = name.toLowerCase();
+        if (lowerName === 'authorization' || lowerName === 'cookie') {
+          this._famous_requestHeaders[name] = '[REDACTED]';
+        } else {
+          this._famous_requestHeaders[name] = String(value).slice(0, 500);
+        }
+      }
+      return XHRSetRequestHeader.apply(this, [name, value]);
+    };
+
+    XMLHttpRequest.prototype.send = function(body) {
+      this._famous_start = performance.now();
+
+      let requestBody = body;
+      if (requestBody && typeof requestBody !== 'string') {
+        try {
+          requestBody = JSON.stringify(requestBody).slice(0, 2000);
+        } catch {
+          requestBody = '[unserializable body]';
+        }
+      } else if (typeof requestBody === 'string') {
+        requestBody = requestBody.slice(0, 2000);
+      }
+
+      const networkEventBase = {
+        ...makeBaseEvent(),
+        type: 'network',
+        transport: 'xhr',
+        requestId: this._famous_reqId,
+        method: (this._famous_method || 'GET').toUpperCase(),
+        url: String(this._famous_url || '').slice(0, 500),
+        requestHeaders: this._famous_requestHeaders || {},
+        requestBody: requestBody
+      };
+
+      this.addEventListener('load', () => {
+        let responseBody;
+        try {
+          responseBody = (this.responseText || '').slice(0, 2000);
+        } catch {
+          responseBody = '[unreadable response body]';
+        }
+
+        // Parse response headers
+        const responseHeaders = {};
+        try {
+          const headerStr = this.getAllResponseHeaders();
+          if (headerStr) {
+            headerStr.split('\r\n').forEach(line => {
+              const parts = line.split(': ');
+              if (parts.length >= 2) {
+                const name = parts[0];
+                const value = parts.slice(1).join(': ');
+                const lowerName = name.toLowerCase();
+                if (lowerName === 'set-cookie') {
+                  responseHeaders[name] = '[REDACTED]';
+                } else {
+                  responseHeaders[name] = value.slice(0, 500);
+                }
+              }
+            });
+          }
+        } catch {
+          // Silently fail if headers can't be read
+        }
+
+        sendToParent({
+          ...networkEventBase,
+          timestamp: Date.now(),
+          status: this.status,
+          statusText: this.statusText,
+          ok: this.status >= 200 && this.status < 300,
+          durationMs: Math.round(performance.now() - this._famous_start),
+          responseHeaders: responseHeaders,
+          responseBody: responseBody
+        });
+      });
+
+      this.addEventListener('error', () => {
+        sendToParent({
+          ...networkEventBase,
+          timestamp: Date.now(),
+          status: 0,
+          ok: false,
+          durationMs: Math.round(performance.now() - this._famous_start),
+          errorMessage: 'Network request failed'
+        });
+      });
+
+      this.addEventListener('abort', () => {
+        sendToParent({
+          ...networkEventBase,
+          timestamp: Date.now(),
+          status: 0,
+          ok: false,
+          durationMs: Math.round(performance.now() - this._famous_start),
+          errorMessage: 'Request aborted'
+        });
+      });
+
+      return XHRSend.apply(this, [body]);
+    };
+
+    // Log that instrumentation is active
+    originalMethods.log('[Famous Debug] Instrumentation active - session:', SESSION_ID);
+  })();
+}
